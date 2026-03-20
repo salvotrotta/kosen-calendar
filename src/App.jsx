@@ -153,6 +153,66 @@ const dayNames = ["Dom", "Lun", "Mar", "Mer", "Gio", "Ven", "Sab"];
 function getMeetingType(id) { return ALL_MEETING_TYPES.find(t => t.id === id) || ALL_MEETING_TYPES[0]; }
 function getMeetingColor(id) { return getMeetingType(id).color; }
 
+// ── EMAILJS CONFIG ────────────────────────────────────────────────────────────
+const EJS = {
+  serviceId: "service_ns5yfrr",
+  templateId: "template_6pap8s2",
+  publicKey: "v7Go8yUq7-a0O_q9w",
+};
+const APP_URL = "https://kosen-calendar.netlify.app";
+const TOKEN_TTL = 30 * 60 * 1000; // 30 minuti in ms
+
+// Carica EmailJS SDK (una sola volta)
+function loadEmailJS() {
+  return new Promise((resolve, reject) => {
+    if (window.emailjs) { resolve(); return; }
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
+    s.onload = () => { window.emailjs.init(EJS.publicKey); resolve(); };
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+// Genera token, salvalo e restituisci il link
+function createResetToken(email) {
+  const token = genId() + genId() + genId();
+  const tokens = JSON.parse(localStorage.getItem("kosen_reset_tokens") || "{}");
+  tokens[token] = { email: email.toLowerCase().trim(), expires: Date.now() + TOKEN_TTL };
+  localStorage.setItem("kosen_reset_tokens", JSON.stringify(tokens));
+  return `${APP_URL}?reset=${token}`;
+}
+
+// Verifica token → restituisce email o null
+function verifyResetToken(token) {
+  try {
+    const tokens = JSON.parse(localStorage.getItem("kosen_reset_tokens") || "{}");
+    const entry = tokens[token];
+    if (!entry) return null;
+    if (Date.now() > entry.expires) return null;
+    return entry.email;
+  } catch { return null; }
+}
+
+// Invalida token dopo uso
+function invalidateToken(token) {
+  try {
+    const tokens = JSON.parse(localStorage.getItem("kosen_reset_tokens") || "{}");
+    delete tokens[token];
+    localStorage.setItem("kosen_reset_tokens", JSON.stringify(tokens));
+  } catch { }
+}
+
+// Invia email di reset via EmailJS
+async function sendResetEmail(toEmail, userName, resetLink) {
+  await loadEmailJS();
+  return window.emailjs.send(EJS.serviceId, EJS.templateId, {
+    to_email: toEmail,
+    user_name: userName || "utente",
+    reset_link: resetLink,
+  });
+}
+
 function useLocalStorage(key, initial) {
   const [val, setVal] = useState(() => {
     try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : initial; } catch { return initial; }
@@ -375,15 +435,146 @@ function EventCard({ ev, onMap, onContact, bookmarks, onBookmark, user, rsvp }) 
   );
 }
 
+// ── FORGOT PASSWORD MODAL ─────────────────────────────────────────────────────
+function ForgotPasswordModal({ open, onClose }) {
+  const [fpEmail, setFpEmail] = useState("");
+  const [sending, setSending] = useState(false);
+  const [done, setDone] = useState(false);
+  const [err, setErr] = useState("");
+
+  async function handleSend() {
+    setErr("");
+    if (!fpEmail.trim()) { setErr("Inserisci la tua email."); return; }
+    const all = getAllUsers();
+    const u = all.find(x => x.email === fpEmail.trim().toLowerCase());
+    if (!u) {
+      // Security: don't reveal if email exists — show same success message
+      setDone(true); return;
+    }
+    setSending(true);
+    try {
+      const link = createResetToken(u.email);
+      await sendResetEmail(u.email, u.name, link);
+      setDone(true);
+    } catch (e) {
+      setErr("Errore nell'invio. Riprova tra qualche minuto.");
+    } finally { setSending(false); }
+  }
+
+  function handleClose() {
+    setFpEmail(""); setDone(false); setErr(""); setSending(false);
+    onClose();
+  }
+
+  return (
+    <Modal open={open} onClose={handleClose} title="Password dimenticata?">
+      {done
+        ? <div style={{ textAlign: "center", padding: "8px 0" }}>
+          <div style={{ fontSize: 48, marginBottom: 12 }}>📧</div>
+          <h3 style={{ color: C.green, margin: "0 0 10px" }}>Email inviata!</h3>
+          <p style={{ fontSize: 13, color: C.gray700, lineHeight: 1.6, marginBottom: 20 }}>
+            Se l'email è registrata, riceverai un link per resettare la password.<br />
+            <b>Il link è valido 30 minuti.</b>
+          </p>
+          <p style={{ fontSize: 12, color: C.gray400, marginBottom: 20 }}>
+            Controlla anche la cartella spam.
+          </p>
+          <Btn onClick={handleClose}>Chiudi</Btn>
+        </div>
+        : <>
+          <p style={{ fontSize: 13, color: C.gray700, marginBottom: 16, lineHeight: 1.6 }}>
+            Inserisci la tua email. Ti invieremo un link per impostare una nuova password.
+          </p>
+          <Field label="Email" type="email" value={fpEmail}
+            onChange={e => setFpEmail(e.target.value)}
+            placeholder="nome@esempio.it" required />
+          {err && <p style={{ color: C.red, fontSize: 13, fontWeight: 600, marginBottom: 12 }}>{err}</p>}
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+            <Btn variant="secondary" onClick={handleClose}>Annulla</Btn>
+            <Btn onClick={handleSend} disabled={sending} icon={sending ? "⏳" : "📧"}>
+              {sending ? "Invio in corso…" : "Invia Link"}
+            </Btn>
+          </div>
+        </>
+      }
+    </Modal>
+  );
+}
+
+// ── RESET PASSWORD PAGE (shown when ?reset=token in URL) ──────────────────────
+function ResetPasswordPage({ token, onDone }) {
+  const email = verifyResetToken(token);
+  const [newPw, setNewPw] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [err, setErr] = useState("");
+  const [ok, setOk] = useState(false);
+
+  function handleSave() {
+    setErr("");
+    if (newPw.length < 6) { setErr("La password deve essere di almeno 6 caratteri."); return; }
+    if (newPw !== confirm) { setErr("Le password non coincidono."); return; }
+    try {
+      const stored = JSON.parse(localStorage.getItem("kosen_users") || "[]");
+      const idx = stored.findIndex(u => u.email === email);
+      if (idx >= 0) {
+        stored[idx].password = newPw;
+        localStorage.setItem("kosen_users", JSON.stringify(stored));
+      }
+      // also update seed-based users if needed (edge case)
+      invalidateToken(token);
+      setOk(true);
+    } catch { setErr("Errore. Riprova."); }
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: `linear-gradient(160deg,${C.blue} 0%,#001E6E 100%)`, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div style={{ width: "100%", maxWidth: 420 }}>
+        <div style={{ textAlign: "center", marginBottom: 28 }}>
+          <div style={{ width: 72, height: 72, borderRadius: 20, background: `linear-gradient(135deg,${C.yellow},${C.red})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, margin: "0 auto 14px", boxShadow: `0 8px 32px ${C.yellow}55` }}>🪷</div>
+          <h1 style={{ color: C.white, fontSize: 22, fontWeight: 900, margin: "0 0 4px", letterSpacing: -1 }}>Kosen Calendar</h1>
+        </div>
+        <Card style={{ borderRadius: 20, padding: 28 }}>
+          {!email
+            ? <div style={{ textAlign: "center", padding: "8px 0" }}>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>⏰</div>
+              <h3 style={{ color: C.red, margin: "0 0 10px" }}>Link non valido o scaduto</h3>
+              <p style={{ fontSize: 13, color: C.gray700, marginBottom: 20, lineHeight: 1.6 }}>
+                Il link di reset è scaduto (validità 30 min) o è già stato usato.<br />
+                Richiedi un nuovo link dalla schermata di login.
+              </p>
+              <Btn onClick={onDone}>Torna al Login</Btn>
+            </div>
+            : ok
+              ? <div style={{ textAlign: "center", padding: "8px 0" }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+                <h3 style={{ color: C.green, margin: "0 0 10px" }}>Password aggiornata!</h3>
+                <p style={{ fontSize: 13, color: C.gray700, marginBottom: 20 }}>Ora puoi accedere con la nuova password.</p>
+                <Btn onClick={onDone} icon="→">Vai al Login</Btn>
+              </div>
+              : <>
+                <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 900, color: C.black }}>🔓 Nuova Password</h2>
+                <p style={{ fontSize: 13, color: C.gray400, marginBottom: 20 }}>Account: <b style={{ color: C.gray700 }}>{email}</b></p>
+                <Field label="Nuova password" type="password" value={newPw}
+                  onChange={e => setNewPw(e.target.value)} required placeholder="min. 6 caratteri" />
+                <Field label="Conferma password" type="password" value={confirm}
+                  onChange={e => setConfirm(e.target.value)} required placeholder="••••••••" />
+                {err && <p style={{ color: C.red, fontSize: 13, fontWeight: 600, marginBottom: 12 }}>{err}</p>}
+                <Btn full onClick={handleSave} icon="🔑">Salva Nuova Password</Btn>
+              </>
+          }
+        </Card>
+      </div>
+    </div>
+  );
+}
+
 // ── AUTH SCREEN (Login + Register) ───────────────────────────────────────────
 function AuthScreen({ onLogin }) {
-  const [tab, setTab] = useState("login"); // login | register | guest | super
-  // login fields
+  const [tab, setTab] = useState("login"); // login | register
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  // register fields
   const [rName, setRName] = useState("");
   const [rEmail, setREmail] = useState("");
   const [rPassword, setRPassword] = useState("");
@@ -391,39 +582,30 @@ function AuthScreen({ onLogin }) {
   const [rCapitolo, setRCapitolo] = useState("Capitolo Pavia");
   const [rSettore, setRSettore] = useState(Object.keys(TERRITORY)[0]);
   const [rGruppo, setRGruppo] = useState("");
-  // guest
   const [gPassword, setGPassword] = useState("");
+  const [forgotOpen, setForgotOpen] = useState(false);
 
   function reset() { setError(""); setSuccess(""); }
 
-  // ── LOGIN ──
   function handleLogin() {
     reset();
-    if (tab === "super") {
-      if (email === "super@kosen.it" && password === "super2024") onLogin({ role: "super", email, name: "Super User" });
-      else setError("Credenziali Super User errate.");
+    if (email === "super@kosen.it") {
+      if (password === "super2024") onLogin({ role: "super", email, name: "Super User" });
+      else setError("Credenziali errate.");
       return;
     }
-    if (tab === "guest") {
-      if (gPassword === VIEW_PASSWORD) onLogin({ role: "user" });
-      else setError("Password ospite non corretta.");
-      return;
-    }
-    // normal login
     const all = getAllUsers();
     const u = all.find(x => x.email === email && x.password === password);
     if (!u) { setError("Email o password errata."); return; }
-    if (!u.approved || u.role === "pending") { setError("Il tuo account è in attesa di approvazione da parte del Super User."); return; }
-    // map legacy admin → resp_gruppo
+    if (!u.approved || u.role === "pending") { setError("Il tuo account è in attesa di approvazione."); return; }
     onLogin({ ...u, role: u.role === "admin" ? "resp_gruppo" : u.role });
   }
 
-  // ── REGISTER ──
   function handleRegister() {
     reset();
     if (!rName.trim() || !rEmail.trim() || !rPassword || !rGruppo) { setError("Compila tutti i campi obbligatori."); return; }
     if (rPassword !== rConfirm) { setError("Le password non coincidono."); return; }
-    if (rPassword.length < 6) { setError("La password deve essere almeno 6 caratteri."); return; }
+    if (rPassword.length < 6) { setError("La password deve essere di almeno 6 caratteri."); return; }
     const all = getAllUsers();
     if (all.find(u => u.email === rEmail.trim().toLowerCase())) { setError("Email già registrata."); return; }
     const newUser = {
@@ -436,7 +618,7 @@ function AuthScreen({ onLogin }) {
       const stored = JSON.parse(localStorage.getItem("kosen_users") || "[]");
       localStorage.setItem("kosen_users", JSON.stringify([...stored, newUser]));
     } catch { }
-    setSuccess("Registrazione completata! Il tuo account è in attesa di approvazione. Contatta il responsabile per essere attivato.");
+    setSuccess("Registrazione completata! Il tuo account è in attesa di approvazione.");
     setRName(""); setREmail(""); setRPassword(""); setRConfirm(""); setRGruppo("");
   }
 
@@ -446,15 +628,13 @@ function AuthScreen({ onLogin }) {
   return (
     <div style={{ minHeight: "100vh", background: `linear-gradient(160deg,${C.blue} 0%,#001E6E 100%)`, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
       <div style={{ width: "100%", maxWidth: 440 }}>
-        {/* Logo */}
         <div style={{ textAlign: "center", marginBottom: 32 }}>
           <div style={{ width: 72, height: 72, borderRadius: 20, background: `linear-gradient(135deg,${C.yellow},${C.red})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, margin: "0 auto 14px", boxShadow: `0 8px 32px ${C.yellow}55` }}>🪷</div>
           <h1 style={{ color: C.white, fontSize: 26, fontWeight: 900, margin: "0 0 4px", letterSpacing: -1 }}>Kosen Calendar</h1>
           <p style={{ color: "rgba(255,255,255,.6)", fontSize: 13, margin: 0 }}>Soka Gakkai · Capitolo Pavia</p>
         </div>
-
         <Card style={{ borderRadius: 20, overflow: "visible" }}>
-          {/* Main tab: Accedi / Registrati */}
+          {/* Tabs: solo Accedi e Registrati */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", padding: "20px 20px 0" }}>
             {[["login", "🔑 Accedi"], ["register", "✍️ Registrati"]].map(([t, l]) => (
               <button key={t} onClick={() => { setTab(t); reset(); }} style={{
@@ -466,85 +646,75 @@ function AuthScreen({ onLogin }) {
               }}>{l}</button>
             ))}
           </div>
-
           <div style={{ padding: "20px 24px 24px" }}>
 
             {/* ── ACCEDI ── */}
-            {(tab === "login" || tab === "super") && (
-              <>
-                {/* sub-tabs inside login */}
-                <div style={{ display: "flex", gap: 6, marginBottom: 20, background: C.gray50, padding: 5, borderRadius: 12 }}>
-                  {[["login", "👤 Utente"], ["super", "⚡ Super"]].map(([t, l]) => (
-                    <button key={t} onClick={() => { setTab(t); reset(); }} style={{ flex: 1, padding: "7px 4px", borderRadius: 9, border: "none", cursor: "pointer", fontWeight: 700, fontSize: 12, fontFamily: "inherit", background: tab === t ? C.blue : "transparent", color: tab === t ? C.white : C.gray400, transition: "all .2s" }}>{l}</button>
-                  ))}
+            {tab === "login" && (<>
+              <Field label="Email" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="nome@esempio.it" />
+              <Field label="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" />
+              {error && <p style={{ color: C.red, fontSize: 13, fontWeight: 600, margin: "0 0 12px" }}>{error}</p>}
+              <Btn full onClick={handleLogin} icon="→">Accedi</Btn>
+              <button onClick={() => setForgotOpen(true)} style={{ display: "block", margin: "12px auto 0", fontSize: 12, color: C.gray400, background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", textDecoration: "underline" }}>
+                Password dimenticata?
+              </button>
+              {/* Guest */}
+              <div style={{ marginTop: 20, paddingTop: 16, borderTop: `1px solid ${C.gray100}` }}>
+                <p style={{ fontSize: 12, color: C.gray400, margin: "0 0 10px", textAlign: "center" }}>Accesso ospite (sola lettura)</p>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input type="password" value={gPassword} onChange={e => setGPassword(e.target.value)} placeholder="Password ospite"
+                    onKeyDown={e => e.key === "Enter" && (gPassword === VIEW_PASSWORD ? onLogin({ role: "user" }) : setError("Password ospite errata."))}
+                    style={{ flex: 1, padding: "9px 12px", borderRadius: 10, border: `1.5px solid ${C.gray200}`, fontSize: 13, fontFamily: "inherit", outline: "none" }} />
+                  <Btn sm variant="ghost" onClick={() => { reset(); if (gPassword === VIEW_PASSWORD) onLogin({ role: "user" }); else setError("Password ospite errata."); }}>Entra</Btn>
                 </div>
-                <Field label="Email" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="nome@esempio.it" />
-                <Field label="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" />
-                {error && <p style={{ color: C.red, fontSize: 13, marginBottom: 12, fontWeight: 600, margin: "0 0 12px" }}>{error}</p>}
-                <Btn full onClick={handleLogin} icon="→">Accedi</Btn>
-
-                {/* Guest access */}
-                <div style={{ marginTop: 20, paddingTop: 16, borderTop: `1px solid ${C.gray100}` }}>
-                  <p style={{ fontSize: 12, color: C.gray400, margin: "0 0 10px", textAlign: "center" }}>Accesso ospite (sola lettura)</p>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <input type="password" value={gPassword} onChange={e => setGPassword(e.target.value)} placeholder="Password ospite" style={{ flex: 1, padding: "9px 12px", borderRadius: 10, border: `1.5px solid ${C.gray200}`, fontSize: 13, fontFamily: "inherit", outline: "none" }} />
-                    <Btn sm variant="ghost" onClick={() => { reset(); if (gPassword === VIEW_PASSWORD) onLogin({ role: "user" }); else setError("Password ospite errata."); }}>Entra</Btn>
-                  </div>
-                </div>
-              </>
-            )}
+              </div>
+            </>)}
 
             {/* ── REGISTRATI ── */}
-            {tab === "register" && (
-              <>
-                {success
-                  ? <div style={{ textAlign: "center", padding: "8px 0" }}>
-                    <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
-                    <h3 style={{ color: C.green, marginBottom: 8 }}>Registrazione completata!</h3>
-                    <p style={{ fontSize: 13, color: C.gray700, marginBottom: 20, lineHeight: 1.6 }}>{success}</p>
-                    <Btn variant="secondary" onClick={() => { setTab("login"); setSuccess(""); }}>Vai al Login</Btn>
+            {tab === "register" && (<>
+              {success
+                ? <div style={{ textAlign: "center", padding: "8px 0" }}>
+                  <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+                  <h3 style={{ color: C.green, marginBottom: 8 }}>Registrazione completata!</h3>
+                  <p style={{ fontSize: 13, color: C.gray700, marginBottom: 20, lineHeight: 1.6 }}>{success}</p>
+                  <Btn variant="secondary" onClick={() => { setTab("login"); setSuccess(""); }}>Vai al Login</Btn>
+                </div>
+                : <>
+                  <Field label="Nome e Cognome" value={rName} onChange={e => setRName(e.target.value)} required placeholder="Mario Rossi" />
+                  <Field label="Email" type="email" value={rEmail} onChange={e => setREmail(e.target.value)} required placeholder="mario@esempio.it" />
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <Field label="Password" type="password" value={rPassword} onChange={e => setRPassword(e.target.value)} required placeholder="min. 6 caratteri" />
+                    <Field label="Conferma" type="password" value={rConfirm} onChange={e => setRConfirm(e.target.value)} required placeholder="••••••••" />
                   </div>
-                  : <>
-                    <Field label="Nome e Cognome" value={rName} onChange={e => setRName(e.target.value)} required placeholder="Mario Rossi" />
-                    <Field label="Email" type="email" value={rEmail} onChange={e => setREmail(e.target.value)} required placeholder="mario@esempio.it" />
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                      <Field label="Password" type="password" value={rPassword} onChange={e => setRPassword(e.target.value)} required placeholder="min. 6 caratteri" />
-                      <Field label="Conferma" type="password" value={rConfirm} onChange={e => setRConfirm(e.target.value)} required placeholder="••••••••" />
+                  <div style={{ background: C.gray50, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+                    <p style={{ fontSize: 12, fontWeight: 700, color: C.gray700, margin: "0 0 12px", letterSpacing: .5 }}>📍 APPARTENENZA TERRITORIALE</p>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+                      {Object.entries(CAPITOLI).map(([cap, info]) => (
+                        <button key={cap} onClick={() => { if (info.disponibile) { setRCapitolo(cap); setRSettore(Object.keys(info.territory)[0] || ""); setRGruppo(""); } }} style={{ padding: "10px 8px", borderRadius: 10, border: `2px solid ${rCapitolo === cap ? C.blue : C.gray200}`, background: rCapitolo === cap ? C.blueLight : C.white, cursor: info.disponibile ? "pointer" : "not-allowed", opacity: info.disponibile ? 1 : .6, textAlign: "center", fontFamily: "inherit", transition: "all .15s" }}>
+                          <div style={{ fontWeight: 800, fontSize: 12, color: rCapitolo === cap ? C.blue : C.black }}>{cap}</div>
+                          {!info.disponibile && <div style={{ fontSize: 10, color: C.gray400, marginTop: 2 }}>🔜 Presto disp.</div>}
+                        </button>
+                      ))}
                     </div>
+                    {capInfo?.disponibile && <>
+                      <Field label="Settore" type="select" value={rSettore} onChange={e => { setRSettore(e.target.value); setRGruppo(""); }} options={Object.keys(capInfo.territory).map(s => ({ value: s, label: s }))} />
+                      <Field label="Gruppo" type="select" value={rGruppo} onChange={e => setRGruppo(e.target.value)} required options={[{ value: "", label: "— Seleziona il tuo gruppo —" }, ...gruppiDisp.map(g => ({ value: g, label: g }))]} />
+                    </>}
+                  </div>
+                  <div style={{ background: C.blueLight, borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 12, color: C.blue }}>
+                    ℹ️ Dopo la registrazione il tuo account sarà <b>in attesa di approvazione</b>.
+                  </div>
+                  {error && <p style={{ color: C.red, fontSize: 13, marginBottom: 12, fontWeight: 600 }}>{error}</p>}
+                  <Btn full onClick={handleRegister} icon="✍️">Crea Account</Btn>
+                </>
+              }
+            </>)}
 
-                    {/* Territorio */}
-                    <div style={{ background: C.gray50, borderRadius: 12, padding: 14, marginBottom: 16 }}>
-                      <p style={{ fontSize: 12, fontWeight: 700, color: C.gray700, margin: "0 0 12px", letterSpacing: .5 }}>📍 APPARTENENZA TERRITORIALE</p>
-                      {/* Capitolo */}
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
-                        {Object.entries(CAPITOLI).map(([cap, info]) => (
-                          <button key={cap} onClick={() => { if (info.disponibile) { setRCapitolo(cap); setRSettore(Object.keys(info.territory)[0] || ""); setRGruppo(""); } }} style={{ padding: "10px 8px", borderRadius: 10, border: `2px solid ${rCapitolo === cap ? C.blue : C.gray200}`, background: rCapitolo === cap ? C.blueLight : C.white, cursor: info.disponibile ? "pointer" : "not-allowed", opacity: info.disponibile ? 1 : .6, textAlign: "center", fontFamily: "inherit", transition: "all .15s" }}>
-                            <div style={{ fontWeight: 800, fontSize: 12, color: rCapitolo === cap ? C.blue : C.black }}>{cap}</div>
-                            {!info.disponibile && <div style={{ fontSize: 10, color: C.gray400, marginTop: 2 }}>🔜 Presto disp.</div>}
-                          </button>
-                        ))}
-                      </div>
-                      {capInfo?.disponibile && <>
-                        <Field label="Settore" type="select" value={rSettore} onChange={e => { setRSettore(e.target.value); setRGruppo(""); }}
-                          options={Object.keys(capInfo.territory).map(s => ({ value: s, label: s }))} />
-                        <Field label="Gruppo" type="select" value={rGruppo} onChange={e => setRGruppo(e.target.value)} required
-                          options={[{ value: "", label: "— Seleziona il tuo gruppo —" }, ...gruppiDisp.map(g => ({ value: g, label: g }))]} />
-                      </>}
-                    </div>
-
-                    <div style={{ background: C.blueLight, borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 12, color: C.blue }}>
-                      ℹ️ Dopo la registrazione il tuo account sarà <b>in attesa di approvazione</b>. Il Super User ti assegnerà il ruolo corretto.
-                    </div>
-
-                    {error && <p style={{ color: C.red, fontSize: 13, marginBottom: 12, fontWeight: 600 }}>{error}</p>}
-                    <Btn full onClick={handleRegister} icon="✍️">Crea Account</Btn>
-                  </>
-                }
-              </>
-            )}
           </div>
         </Card>
       </div>
+
+      {/* Forgot password modal */}
+      <ForgotPasswordModal open={forgotOpen} onClose={() => setForgotOpen(false)} />
     </div>
   );
 }
@@ -695,13 +865,218 @@ function CalendarView({ events, bookmarks, setBookmarks, user, extraFilters, acc
       )}
 
       <Modal open={!!contactModal} onClose={() => setContactModal(null)} title="Contatta il Responsabile">
-        {contactModal && <div><p style={{ color: C.gray700, fontSize: 14 }}>Responsabile di <b>{contactModal.gruppo}</b></p><p style={{ fontWeight: 800, fontSize: 16, color: C.black }}>{contactModal.adminNome}</p><Btn full icon="📧" onClick={() => window.open(`mailto:${contactModal.adminEmail}`)}>Email</Btn></div>}
+        {contactModal && (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, background: C.gray50, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+              <div style={{ width: 44, height: 44, borderRadius: 12, background: `linear-gradient(135deg,${C.blue},${C.blueMid})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>👤</div>
+              <div>
+                <p style={{ margin: "0 0 3px", fontWeight: 800, fontSize: 15, color: C.black }}>{contactModal.adminNome}</p>
+                <p style={{ margin: 0, fontSize: 12, color: C.gray400 }}>Responsabile di <b style={{ color: C.gray700 }}>{contactModal.gruppo}</b></p>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {contactModal.adminTel && (
+                <Btn full icon="💬" onClick={() => window.open(`https://wa.me/${contactModal.adminTel.replace(/\D/g, "")}?text=${encodeURIComponent(`Ciao ${contactModal.adminNome}, ti scrivo riguardo all'evento: ${contactModal.titolo}`)}`)}>
+                  WhatsApp
+                </Btn>
+              )}
+              <Btn full variant="secondary" icon="📧" onClick={() => window.open(`mailto:${contactModal.adminEmail}?subject=${encodeURIComponent("Info evento: " + contactModal.titolo)}`)}>
+                Email
+              </Btn>
+            </div>
+            {!contactModal.adminTel && <p style={{ fontSize: 11, color: C.gray400, textAlign: "center", marginTop: 12 }}>Il responsabile non ha inserito un numero WhatsApp</p>}
+          </div>
+        )}
       </Modal>
     </>
   );
 }
 
 // ── NAV HELPERS ───────────────────────────────────────────────────────────────
+
+// ── SHARED PROFILE MODAL ──────────────────────────────────────────────────────
+// Used by both MemberView and ResponsabileView.
+// Handles: view info, edit phone, change password, showName toggle, bookmarks
+function ProfileModal({ open, onClose, user, prefs, setP, bookmarks, setBookmarks, events, luoghi, setLuogoModal, adminData, setAdminData }) {
+  const role = getRole(user.role);
+  const [pwForm, setPwForm] = useState({ current: "", next: "", confirm: "" });
+  const [pwError, setPwError] = useState("");
+  const [pwOk, setPwOk] = useState(false);
+  const [telEdit, setTelEdit] = useState(false);
+  const [tel, setTel] = useState(adminData?.telefono || "");
+
+  function saveTel() {
+    if (adminData && setAdminData) {
+      setAdminData(d => ({ ...d, telefono: tel }));
+    } else {
+      // For members: save in kosen_users
+      try {
+        const stored = JSON.parse(localStorage.getItem("kosen_users") || "[]");
+        const idx = stored.findIndex(u => u.id === user.id);
+        if (idx >= 0) { stored[idx].telefono = tel; localStorage.setItem("kosen_users", JSON.stringify(stored)); }
+      } catch { }
+    }
+    setTelEdit(false);
+  }
+
+  function changePassword() {
+    setPwError(""); setPwOk(false);
+    const all = getAllUsers();
+    const u = all.find(x => x.id === user.id);
+    if (!u) { setPwError("Utente non trovato."); return; }
+    if (u.password !== pwForm.current) { setPwError("La password attuale non è corretta."); return; }
+    if (pwForm.next.length < 6) { setPwError("La nuova password deve essere di almeno 6 caratteri."); return; }
+    if (pwForm.next !== pwForm.confirm) { setPwError("Le nuove password non coincidono."); return; }
+    try {
+      const stored = JSON.parse(localStorage.getItem("kosen_users") || "[]");
+      const idx = stored.findIndex(x => x.id === user.id);
+      if (idx >= 0) {
+        stored[idx].password = pwForm.next;
+        localStorage.setItem("kosen_users", JSON.stringify(stored));
+        setPwOk(true);
+        setPwForm({ current: "", next: "", confirm: "" });
+      } else {
+        setPwError("Questo account non può cambiare password da qui. Usa Reset dal login.");
+      }
+    } catch { setPwError("Errore. Riprova."); }
+  }
+
+  const currentTel = adminData?.telefono || "";
+
+  return (
+    <Modal open={open} onClose={onClose} title="Il Mio Profilo" wide>
+      {/* Identity card */}
+      <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20, padding: 14, background: C.gray50, borderRadius: 12 }}>
+        <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${role.color},${role.color}88)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, flexShrink: 0 }}>{role.icon}</div>
+        <div><p style={{ margin: "0 0 4px", fontWeight: 800, fontSize: 16, color: C.black }}>{user.name}</p><Chip label={role.label} color={role.color} small /></div>
+      </div>
+
+      {/* Info rows */}
+      {[["Email", user.email], ["Capitolo", user.capitolo], ["Settore", user.settore], ["Gruppo", user.gruppo]].map(([k, v]) => (
+        <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "9px 0", borderBottom: `1px solid ${C.gray100}` }}>
+          <span style={{ fontSize: 13, color: C.gray400, fontWeight: 600 }}>{k}</span>
+          <span style={{ fontSize: 13, color: C.black, fontWeight: 700 }}>{v}</span>
+        </div>
+      ))}
+
+      {/* Phone */}
+      <div style={{ padding: "12px 0", borderBottom: `1px solid ${C.gray100}` }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, color: C.gray400, fontWeight: 600 }}>📱 Cellulare (WhatsApp)</span>
+          {!telEdit && <button onClick={() => { setTel(currentTel); setTelEdit(true); }} style={{ fontSize: 12, color: C.blue, background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", fontWeight: 700 }}>{currentTel ? "Modifica" : "+ Aggiungi"}</button>}
+        </div>
+        {!telEdit && (
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: currentTel ? C.black : C.gray400, fontWeight: currentTel ? 700 : 400 }}>
+            {currentTel || "Non inserito"}
+          </p>
+        )}
+        {telEdit && (
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <input type="tel" value={tel} onChange={e => setTel(e.target.value)} placeholder="+39 333 123 4567"
+              style={{ flex: 1, padding: "9px 12px", borderRadius: 10, border: `1.5px solid ${C.blue}`, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+            <Btn sm onClick={saveTel}>Salva</Btn>
+            <Btn sm variant="secondary" onClick={() => setTelEdit(false)}>✕</Btn>
+          </div>
+        )}
+      </div>
+
+      {/* showName toggle */}
+      {prefs && setP && (
+        <div style={{ padding: "12px 0", borderBottom: `1px solid ${C.gray100}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <span style={{ fontSize: 13, color: C.gray400, fontWeight: 600 }}>👁 Visibilità negli eventi</span>
+              <p style={{ margin: "3px 0 0", fontSize: 12, color: C.gray700 }}>{prefs.showName !== false ? "Il tuo nome è visibile ai partecipanti" : "Appari come «Anonimo»"}</p>
+            </div>
+            <button onClick={() => setP("showName", prefs.showName === false ? true : false)} style={{
+              padding: "5px 16px", borderRadius: 99, border: "none", cursor: "pointer", fontFamily: "inherit", fontWeight: 800, fontSize: 12,
+              background: prefs.showName !== false ? C.blue : C.gray200,
+              color: prefs.showName !== false ? C.white : C.gray700,
+              transition: "all .2s",
+            }}>{prefs.showName !== false ? "ON" : "OFF"}</button>
+          </div>
+        </div>
+      )}
+
+      {/* Bookmarks */}
+      {bookmarks && setBookmarks && (
+        <div style={{ background: C.yellowLight, border: `1.5px solid ${C.yellow}`, borderRadius: 12, padding: "12px 14px", marginTop: 16, marginBottom: 16 }}>
+          <p style={{ margin: "0 0 6px", fontWeight: 800, color: "#8B6000", fontSize: 13 }}>★ Preferiti ({bookmarks.length})</p>
+          {bookmarks.length === 0
+            ? <p style={{ fontSize: 13, color: "#8B6000", margin: 0 }}>Nessun evento salvato. Tocca ☆ per aggiungerlo.</p>
+            : <>
+              {events.filter(e => bookmarks.includes(e.id)).slice(0, 5).map(e => (
+                <div key={e.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "5px 0", borderTop: `1px solid ${C.yellow}44` }}>
+                  <span style={{ fontSize: 13, color: C.black, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.titolo}</span>
+                  <button onClick={() => setBookmarks(b => b.filter(x => x !== e.id))} style={{ background: "none", border: "none", cursor: "pointer", color: "#8B6000", fontSize: 16, marginLeft: 8 }}>★</button>
+                </div>
+              ))}
+              {bookmarks.length > 0 && <button onClick={() => setBookmarks([])} style={{ marginTop: 8, fontSize: 12, color: "#8B6000", background: "none", border: "none", cursor: "pointer", textDecoration: "underline", fontFamily: "inherit" }}>Cancella tutti</button>}
+            </>
+          }
+        </div>
+      )}
+
+      {/* Luoghi (responsabili only) */}
+      {luoghi !== undefined && (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <h3 style={{ margin: 0, fontSize: 15, fontWeight: 800 }}>📍 Miei Luoghi</h3>
+            {setLuogoModal && <Btn sm icon="+" onClick={() => { onClose(); setLuogoModal(true); }}>Aggiungi</Btn>}
+          </div>
+          {(luoghi || []).map(l => (
+            <Card key={l.id} style={{ marginBottom: 10, padding: "12px 16px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <div>
+                  <p style={{ margin: "0 0 2px", fontWeight: 800, fontSize: 14 }}>{l.nome}</p>
+                  <p style={{ margin: "0 0 2px", fontSize: 13, color: C.gray700 }}>📍 {[l.via, l.civico].filter(Boolean).join(" ")}{l.comune ? ", " + l.comune : ""}</p>
+                  {l.citofono && <p style={{ margin: 0, fontSize: 13, color: C.gray700 }}>🔔 {l.citofono}</p>}
+                </div>
+                {setAdminData && <IconBtn icon="🗑" onClick={() => setAdminData(d => ({ ...d, luoghi: d.luoghi.filter(x => x.id !== l.id) }))} sm color={C.red} />}
+              </div>
+            </Card>
+          ))}
+          {(luoghi || []).length === 0 && <p style={{ color: C.gray400, fontSize: 14, textAlign: "center", padding: 20 }}>Nessun luogo salvato.</p>}
+        </>
+      )}
+
+      {/* Visibilità toggle for responsabili (no bookmarks) */}
+      {prefs && setP && !bookmarks && (
+        <div style={{ marginTop: 16, background: C.blueLight, border: `1.5px solid ${C.blue}44`, borderRadius: 12, padding: "12px 14px", marginBottom: 16 }}>
+          <p style={{ margin: "0 0 10px", fontWeight: 800, color: C.blue, fontSize: 13 }}>👁 Visibilità negli eventi</p>
+          <button onClick={() => setP("showName", !(prefs.showName !== false))} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", borderRadius: 10, border: `2px solid ${prefs.showName !== false ? C.blue : C.gray200}`, background: prefs.showName !== false ? C.white : C.gray50, cursor: "pointer", fontFamily: "inherit", transition: "all .2s" }}>
+            <div style={{ textAlign: "left" }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: prefs.showName !== false ? C.black : C.gray400 }}>{prefs.showName !== false ? "Nome visibile" : "Partecipazione anonima"}</div>
+              <div style={{ fontSize: 11, color: C.gray400, marginTop: 2 }}>{prefs.showName !== false ? "Il tuo nome appare nella lista partecipanti" : "Appari come «Anonimo»"}</div>
+            </div>
+            <span style={{ fontSize: 12, fontWeight: 800, padding: "3px 12px", borderRadius: 99, background: prefs.showName !== false ? C.blue : C.gray200, color: prefs.showName !== false ? C.white : C.gray700, marginLeft: 12, flexShrink: 0 }}>{prefs.showName !== false ? "ON" : "OFF"}</span>
+          </button>
+        </div>
+      )}
+
+      {/* Change Password */}
+      <div style={{ marginTop: 16, background: C.gray50, border: `1.5px solid ${C.gray200}`, borderRadius: 12, padding: "14px 16px" }}>
+        <p style={{ margin: "0 0 12px", fontWeight: 800, fontSize: 13, color: C.gray700 }}>🔑 Cambia Password</p>
+        {pwOk && <p style={{ color: C.green, fontSize: 13, fontWeight: 700, marginBottom: 10 }}>✅ Password aggiornata!</p>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {[["current", "Password attuale", "••••••••"], ["next", "Nuova password", "min. 6 caratteri"], ["confirm", "Conferma", "••••••••"]].map(([k, l, ph]) => (
+            <div key={k}>
+              <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: C.gray400, marginBottom: 4, letterSpacing: .5 }}>{l}</label>
+              <input type="password" value={pwForm[k]} onChange={e => setPwForm(f => ({ ...f, [k]: e.target.value }))} placeholder={ph}
+                style={{ width: "100%", padding: "9px 12px", borderRadius: 10, border: `1.5px solid ${C.gray200}`, fontSize: 14, fontFamily: "inherit", outline: "none", boxSizing: "border-box" }} />
+            </div>
+          ))}
+        </div>
+        {pwError && <p style={{ color: C.red, fontSize: 12, fontWeight: 600, marginTop: 8 }}>{pwError}</p>}
+        <div style={{ marginTop: 12 }}>
+          <Btn sm onClick={changePassword} icon="🔑">Aggiorna Password</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+
 function NavBtn({ icon, label, onClick, color = C.blue }) {
   return (
     <button onClick={onClick} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, background: "none", border: "none", cursor: "pointer", padding: "4px 8px", borderRadius: 8, transition: "background .15s" }}
@@ -776,56 +1151,13 @@ function MemberView({ user, events, onLogout }) {
 
       <CalendarView events={events} bookmarks={bookmarks} setBookmarks={setBookmarks} user={user} extraFilters={prefs.mioFiltro ? extraFilters : null} rsvp={rsvp} />
 
-      {/* Profile modal */}
-      <Modal open={profileOpen} onClose={() => setProfileOpen(false)} title="Il Mio Profilo">
-        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20, padding: "14px", background: C.gray50, borderRadius: 12 }}>
-          <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${role.color},${role.color}88)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, flexShrink: 0 }}>{role.icon}</div>
-          <div><p style={{ margin: "0 0 4px", fontWeight: 800, fontSize: 16, color: C.black }}>{user.name}</p><Chip label={role.label} color={role.color} small /></div>
-        </div>
-        {[["Email", user.email], ["Capitolo", user.capitolo], ["Settore", user.settore], ["Gruppo", user.gruppo]].map(([k, v]) => (
-          <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "9px 0", borderBottom: `1px solid ${C.gray100}` }}>
-            <span style={{ fontSize: 13, color: C.gray400, fontWeight: 600 }}>{k}</span>
-            <span style={{ fontSize: 13, color: C.black, fontWeight: 700 }}>{v}</span>
-          </div>
-        ))}
-        <div style={{ background: C.yellowLight, border: `1.5px solid ${C.yellow}`, borderRadius: 12, padding: "12px 14px", marginTop: 16 }}>
-          <p style={{ margin: "0 0 6px", fontWeight: 800, color: "#8B6000", fontSize: 13 }}>★ Preferiti ({bookmarks.length})</p>
-          {bookmarks.length === 0 ? <p style={{ fontSize: 13, color: "#8B6000", margin: 0 }}>Nessun evento salvato. Tocca ☆ per aggiungerlo.</p>
-            : <>{events.filter(e => bookmarks.includes(e.id)).slice(0, 5).map(e => (
-              <div key={e.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "5px 0", borderTop: `1px solid ${C.yellow}44` }}>
-                <span style={{ fontSize: 13, color: C.black, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.titolo}</span>
-                <button onClick={() => setBookmarks(b => b.filter(x => x !== e.id))} style={{ background: "none", border: "none", cursor: "pointer", color: "#8B6000", fontSize: 16, marginLeft: 8 }}>★</button>
-              </div>))}
-              {bookmarks.length > 0 && <button onClick={() => setBookmarks([])} style={{ marginTop: 8, fontSize: 12, color: "#8B6000", background: "none", border: "none", cursor: "pointer", textDecoration: "underline", fontFamily: "inherit" }}>Cancella tutti</button>}
-            </>
-          }
-        </div>
-
-        {/* showName preference */}
-        <div style={{ marginTop: 16, background: C.blueLight, border: `1.5px solid ${C.blue}44`, borderRadius: 12, padding: "12px 14px" }}>
-          <p style={{ margin: "0 0 10px", fontWeight: 800, color: C.blue, fontSize: 13 }}>👁 Visibilità negli eventi</p>
-          <button onClick={() => setP("showName", !prefs.showName)} style={{
-            width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
-            padding: "10px 14px", borderRadius: 10, border: `2px solid ${prefs.showName ? C.blue : C.gray200}`,
-            background: prefs.showName ? C.white : C.gray50, cursor: "pointer", fontFamily: "inherit", transition: "all .2s",
-          }}>
-            <div style={{ textAlign: "left" }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: prefs.showName ? C.black : C.gray400 }}>
-                {prefs.showName ? "Nome visibile" : "Partecipazione anonima"}
-              </div>
-              <div style={{ fontSize: 11, color: C.gray400, marginTop: 2 }}>
-                {prefs.showName ? "Il tuo nome appare nella lista partecipanti" : "Appari come «Anonimo» nella lista"}
-              </div>
-            </div>
-            <span style={{
-              fontSize: 12, fontWeight: 800, padding: "3px 12px", borderRadius: 99,
-              background: prefs.showName ? C.blue : C.gray200,
-              color: prefs.showName ? C.white : C.gray700,
-              marginLeft: 12, flexShrink: 0,
-            }}>{prefs.showName ? "ON" : "OFF"}</span>
-          </button>
-        </div>
-      </Modal>
+      {/* Profile modal — shared component */}
+      <ProfileModal
+        open={profileOpen} onClose={() => setProfileOpen(false)}
+        user={user} prefs={prefs} setP={setP}
+        bookmarks={bookmarks} setBookmarks={setBookmarks} events={events}
+        adminData={null} setAdminData={null}
+      />
     </div>
   );
 }
@@ -887,7 +1219,7 @@ function ResponsabileView({ user, events, setEvents, onLogout }) {
     if (!form.titolo || !form.data || !form.oraInizio) { showToast("Compila i campi obbligatori", "error"); return; }
     const luogo = adminData.luoghi[parseInt(form.luogoIdx) || 0] || adminData.luoghi[0];
     if (!luogo) { showToast("Aggiungi un luogo nel profilo!", "error"); return; }
-    const ev = { id: editEv?.id || genId(), titolo: form.titolo, tipo: form.tipo, capitolo: user.capitolo, settore: user.settore, gruppo: user.gruppo, data: form.data, oraInizio: form.oraInizio, oraFine: form.oraFine, luogo, note: form.note, adminId: user.id, adminNome: adminData.name, adminEmail: adminData.email };
+    const ev = { id: editEv?.id || genId(), titolo: form.titolo, tipo: form.tipo, capitolo: user.capitolo, settore: user.settore, gruppo: user.gruppo, data: form.data, oraInizio: form.oraInizio, oraFine: form.oraFine, luogo, note: form.note, adminId: user.id, adminNome: adminData.name, adminEmail: adminData.email, adminTel: adminData.telefono || "" };
     if (editEv) { setEvents(es => es.map(e => e.id === ev.id ? ev : e)); showToast("Aggiornato!"); }
     else { setEvents(es => [...es, ev]); showToast("Evento creato!"); }
     setNewEvModal(false);
@@ -974,52 +1306,14 @@ function ResponsabileView({ user, events, setEvents, onLogout }) {
         <CalendarView events={events} bookmarks={bookmarks} setBookmarks={setBookmarks} user={user} accentColor={role.color} stickyTop={109} rsvp={rsvp} />
       )}
 
-      {/* PROFILE MODAL (triggered from nav) */}
-      <Modal open={profileOpen} onClose={() => setProfileOpen(false)} title="Il Mio Profilo" wide>
-        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20, padding: 14, background: C.gray50, borderRadius: 12 }}>
-          <div style={{ width: 52, height: 52, borderRadius: 14, background: `linear-gradient(135deg,${role.color},${role.color}88)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, flexShrink: 0 }}>{role.icon}</div>
-          <div><p style={{ margin: "0 0 4px", fontWeight: 800, fontSize: 16, color: C.black }}>{user.name}</p><Chip label={role.label} color={role.color} small /></div>
-        </div>
-        {[["Email", user.email], ["Capitolo", user.capitolo], ["Settore", user.settore], ["Gruppo", user.gruppo]].map(([k, v]) => (
-          <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${C.gray100}` }}>
-            <span style={{ fontSize: 13, color: C.gray400, fontWeight: 600 }}>{k}</span>
-            <span style={{ fontSize: 13, color: C.black, fontWeight: 700 }}>{v}</span>
-          </div>
-        ))}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "20px 0 12px" }}>
-          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 800 }}>📍 Miei Luoghi</h3>
-          <Btn sm icon="+" onClick={() => { setProfileOpen(false); setLuogoModal(true); }}>Aggiungi</Btn>
-        </div>
-        {(adminData.luoghi || []).map(l => (
-          <Card key={l.id} style={{ marginBottom: 10, padding: "12px 16px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <div><p style={{ margin: "0 0 2px", fontWeight: 800, fontSize: 14 }}>{l.nome}</p><p style={{ margin: "0 0 2px", fontSize: 13, color: C.gray700 }}>📍 {[l.via, l.civico].filter(Boolean).join(" ")}{l.comune ? ", " + l.comune : ""}</p>{l.citofono && <p style={{ margin: 0, fontSize: 13, color: C.gray700 }}>🔔 {l.citofono}</p>}</div>
-              <IconBtn icon="🗑" onClick={() => setAdminData(d => ({ ...d, luoghi: d.luoghi.filter(x => x.id !== l.id) }))} sm color={C.red} />
-            </div>
-          </Card>
-        ))}
-        {(adminData.luoghi || []).length === 0 && <p style={{ color: C.gray400, fontSize: 14, textAlign: "center", padding: 20 }}>Nessun luogo salvato.</p>}
-
-        {/* showName preference */}
-        <div style={{ marginTop: 16, background: C.blueLight, border: `1.5px solid ${C.blue}44`, borderRadius: 12, padding: "12px 14px" }}>
-          <p style={{ margin: "0 0 10px", fontWeight: 800, color: C.blue, fontSize: 13 }}>👁 Visibilità negli eventi</p>
-          <button onClick={() => setP("showName", !prefs.showName)} style={{
-            width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
-            padding: "10px 14px", borderRadius: 10, border: `2px solid ${prefs.showName ? C.blue : C.gray200}`,
-            background: prefs.showName ? C.white : C.gray50, cursor: "pointer", fontFamily: "inherit", transition: "all .2s",
-          }}>
-            <div style={{ textAlign: "left" }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: prefs.showName ? C.black : C.gray400 }}>
-                {prefs.showName ? "Nome visibile" : "Partecipazione anonima"}
-              </div>
-              <div style={{ fontSize: 11, color: C.gray400, marginTop: 2 }}>
-                {prefs.showName ? "Il tuo nome appare nella lista partecipanti" : "Appari come «Anonimo»"}
-              </div>
-            </div>
-            <span style={{ fontSize: 12, fontWeight: 800, padding: "3px 12px", borderRadius: 99, background: prefs.showName ? C.blue : C.gray200, color: prefs.showName ? C.white : C.gray700, marginLeft: 12, flexShrink: 0 }}>{prefs.showName ? "ON" : "OFF"}</span>
-          </button>
-        </div>
-      </Modal>
+      {/* PROFILE MODAL (triggered from nav) — shared component */}
+      <ProfileModal
+        open={profileOpen} onClose={() => setProfileOpen(false)}
+        user={user} prefs={prefs} setP={setP}
+        bookmarks={null} setBookmarks={null} events={events}
+        luoghi={adminData.luoghi || []} setLuogoModal={setLuogoModal}
+        adminData={adminData} setAdminData={setAdminData}
+      />
 
       {/* TYPE SELECTOR MODAL */}
       <Modal open={typeSelModal} onClose={() => setTypeSelModal(false)} title="Scegli il tipo di meeting">
@@ -1368,6 +1662,16 @@ function EditUserModal({ user, onSave, onClose }) {
 export default function App() {
   const [session, setSession] = useLocalStorage("kosen_session", null);
   const [events, setEvents] = useLocalStorage("kosen_events", SEED_EVENTS);
+
+  // Check for reset token in URL query string
+  const resetToken = new URLSearchParams(window.location.search).get("reset");
+  if (resetToken) {
+    return <ResetPasswordPage token={resetToken} onDone={() => {
+      // Remove ?reset=... from URL and show login
+      window.history.replaceState({}, "", window.location.pathname);
+      window.location.reload();
+    }} />;
+  }
 
   if (!session) return <AuthScreen onLogin={setSession} />;
 
