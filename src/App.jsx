@@ -151,11 +151,11 @@ function loadEmailJS(){
   });
 }
 
-// Genera token self-contained (email+scadenza in base64) e restituisce il link
+// Genera token self-contained usando base64url (URL-safe: no +, /, =)
 function createResetToken(email){
   const data={email:email.toLowerCase().trim(),expires:Date.now()+TOKEN_TTL};
-  const token=btoa(JSON.stringify(data));
-  return `${APP_URL}?reset=${encodeURIComponent(token)}`;
+  const token=btoa(JSON.stringify(data)).replace(/\+/g,"-").replace(/\//g,"_").replace(/=/g,"");
+  return `${APP_URL}?reset=${token}`;
 }
 
 // Verifica token → restituisce email o null
@@ -163,7 +163,10 @@ function verifyResetToken(token){
   try{
     const usedTokens=JSON.parse(localStorage.getItem("kosen_used_tokens")||"[]");
     if(usedTokens.includes(token)) return null;
-    const data=JSON.parse(atob(decodeURIComponent(token)));
+    // ripristina base64 standard da base64url
+    let b64=token.replace(/-/g,"+").replace(/_/g,"/");
+    while(b64.length%4) b64+="=";
+    const data=JSON.parse(atob(b64));
     if(!data.email||!data.expires) return null;
     if(Date.now()>data.expires) return null;
     return data.email;
