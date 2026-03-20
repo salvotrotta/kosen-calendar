@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { Analytics } from "./analytics.js";
 
 // ── PALETTE ───────────────────────────────────────────────────────────────────
 const C = {
@@ -566,15 +567,17 @@ function AuthScreen({onLogin}){
   function handleLogin(){
     reset();
     if(email==="super@kosen.it"){
-      if(password==="super2024") onLogin({role:"super",email,name:"Super User"});
-      else setError("Credenziali errate.");
+      if(password==="super2024"){ Analytics.loginSuccess("super"); onLogin({role:"super",email,name:"Super User"}); }
+      else{ Analytics.loginFailure("wrong_password"); setError("Credenziali errate."); }
       return;
     }
     const all=getAllUsers();
     const u=all.find(x=>x.email===email&&x.password===password);
-    if(!u){ setError("Email o password errata."); return; }
-    if(!u.approved||u.role==="pending"){ setError("Il tuo account è in attesa di approvazione."); return; }
-    onLogin({...u, role: u.role==="admin"?"resp_gruppo":u.role });
+    if(!u){ Analytics.loginFailure("not_found"); setError("Email o password errata."); return; }
+    if(!u.approved||u.role==="pending"){ Analytics.loginFailure("pending"); setError("Il tuo account è in attesa di approvazione."); return; }
+    const role=u.role==="admin"?"resp_gruppo":u.role;
+    Analytics.loginSuccess(role);
+    onLogin({...u, role });
   }
 
   function handleRegister(){
@@ -594,6 +597,7 @@ function AuthScreen({onLogin}){
       const stored=JSON.parse(localStorage.getItem("kosen_users")||"[]");
       localStorage.setItem("kosen_users",JSON.stringify([...stored,newUser]));
     }catch{}
+    Analytics.register();
     setSuccess("Registrazione completata! Il tuo account è in attesa di approvazione.");
     setRName("");setREmail("");setRPassword("");setRConfirm("");setRGruppo("");
   }
@@ -1196,8 +1200,8 @@ function ResponsabileView({user,events,setEvents,onLogout}){
     const luogo=adminData.luoghi[parseInt(form.luogoIdx)||0]||adminData.luoghi[0];
     if(!luogo){showToast("Aggiungi un luogo nel profilo!","error");return;}
     const ev={id:editEv?.id||genId(),titolo:form.titolo,tipo:form.tipo,capitolo:user.capitolo,settore:user.settore,gruppo:user.gruppo,data:form.data,oraInizio:form.oraInizio,oraFine:form.oraFine,luogo,note:form.note,adminId:user.id,adminNome:adminData.name,adminEmail:adminData.email,adminTel:adminData.telefono||""};
-    if(editEv){setEvents(es=>es.map(e=>e.id===ev.id?ev:e));showToast("Aggiornato!");}
-    else{setEvents(es=>[...es,ev]);showToast("Evento creato!");}
+    if(editEv){Analytics.eventEdited(ev.tipo);setEvents(es=>es.map(e=>e.id===ev.id?ev:e));showToast("Aggiornato!");}
+    else{Analytics.eventCreated(ev.tipo);setEvents(es=>[...es,ev]);showToast("Evento creato!");}
     setNewEvModal(false);
   }
 
@@ -1376,7 +1380,7 @@ function ResponsabileView({user,events,setEvents,onLogout}){
         <p style={{color:C.gray700,fontSize:14,marginBottom:20}}>Eliminare questo meeting?</p>
         <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
           <Btn variant="secondary" onClick={()=>setDelConfirm(null)}>Annulla</Btn>
-          <Btn variant="danger" onClick={()=>{setEvents(es=>es.filter(e=>e.id!==delConfirm));setDelConfirm(null);showToast("Eliminato","info");}}>Elimina</Btn>
+          <Btn variant="danger" onClick={()=>{const del=events.find(e=>e.id===delConfirm);Analytics.eventDeleted(del?.tipo);setEvents(es=>es.filter(e=>e.id!==delConfirm));setDelConfirm(null);showToast("Eliminato","info");}}>Elimina</Btn>
         </div>
       </Modal>
 
@@ -1650,7 +1654,7 @@ export default function App(){
   if(!session) return <AuthScreen onLogin={setSession}/>;
 
   const role=session.role;
-  const logout=()=>setSession(null);
+  const logout=()=>{Analytics.logout(role);setSession(null);};
 
   if(role==="super")  return <SuperView user={session} events={events} setEvents={setEvents} onLogout={logout}/>;
   if(canCreateEvents(role)) return <ResponsabileView user={session} events={events} setEvents={setEvents} onLogout={logout}/>;
