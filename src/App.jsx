@@ -151,32 +151,31 @@ function loadEmailJS(){
   });
 }
 
-// Genera token, salvalo e restituisci il link
+// Genera token self-contained (email+scadenza in base64) e restituisce il link
 function createResetToken(email){
-  const token=genId()+genId()+genId();
-  const tokens=JSON.parse(localStorage.getItem("kosen_reset_tokens")||"{}");
-  tokens[token]={email:email.toLowerCase().trim(), expires:Date.now()+TOKEN_TTL};
-  localStorage.setItem("kosen_reset_tokens",JSON.stringify(tokens));
-  return `${APP_URL}?reset=${token}`;
+  const data={email:email.toLowerCase().trim(),expires:Date.now()+TOKEN_TTL};
+  const token=btoa(JSON.stringify(data));
+  return `${APP_URL}?reset=${encodeURIComponent(token)}`;
 }
 
 // Verifica token → restituisce email o null
 function verifyResetToken(token){
   try{
-    const tokens=JSON.parse(localStorage.getItem("kosen_reset_tokens")||"{}");
-    const entry=tokens[token];
-    if(!entry) return null;
-    if(Date.now()>entry.expires) return null;
-    return entry.email;
+    const usedTokens=JSON.parse(localStorage.getItem("kosen_used_tokens")||"[]");
+    if(usedTokens.includes(token)) return null;
+    const data=JSON.parse(atob(decodeURIComponent(token)));
+    if(!data.email||!data.expires) return null;
+    if(Date.now()>data.expires) return null;
+    return data.email;
   }catch{ return null; }
 }
 
-// Invalida token dopo uso
+// Invalida token dopo uso (impedisce riutilizzo nello stesso browser)
 function invalidateToken(token){
   try{
-    const tokens=JSON.parse(localStorage.getItem("kosen_reset_tokens")||"{}");
-    delete tokens[token];
-    localStorage.setItem("kosen_reset_tokens",JSON.stringify(tokens));
+    const usedTokens=JSON.parse(localStorage.getItem("kosen_used_tokens")||"[]");
+    usedTokens.push(token);
+    localStorage.setItem("kosen_used_tokens",JSON.stringify(usedTokens));
   }catch{}
 }
 
