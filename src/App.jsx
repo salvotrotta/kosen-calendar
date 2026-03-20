@@ -521,6 +521,9 @@ function ResetPasswordPage({token,onDone}){
                  Il link di reset è scaduto (validità 30 min) o è già stato usato.<br/>
                  Richiedi un nuovo link dalla schermata di login.
                </p>
+               <p style={{fontSize:10,color:C.gray400,wordBreak:"break-all",marginBottom:16}}>
+                 [debug] token: {token ? token.slice(0,40)+"…(len:"+token.length+")" : "assente"}
+               </p>
                <Btn onClick={onDone}>Torna al Login</Btn>
              </div>
             :ok
